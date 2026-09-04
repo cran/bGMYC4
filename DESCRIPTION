@@ -1,0 +1,36 @@
+Package: bGMYC4
+Type: Package
+Title: Bayesian General Mixed Yule-Coalescent Model for Species
+        Delimitation
+Version: 4.1.6
+Authors@R: c(
+    person("Noah", "Reid", email = "noah.reid@gmail.com",
+           role = c("aut", "cph"), comment = "Original author of bGMYC"),
+    person("Dmitry", "Karabanov", email = "dk@ibiw.ru",
+           role = c("aut", "cre"),
+           comment = c(ORCID = "0000-0001-6008-7441"))
+  )
+Description: Implements a Bayesian version of the general mixed
+    Yule-coalescent model for species delimitation. It uses Markov
+    Chain Monte Carlo simulation to evaluate the posterior
+    distribution of the model and supports flexible prior
+    specification on model parameters.
+License: GPL (>= 3)
+Encoding: UTF-8
+LazyData: true
+Depends: R (>= 4.0.0)
+Imports: ape (>= 5.0), future, future.apply
+Suggests: mcmcse, plotly, base64enc, testthat (>= 3.0.0), knitr,
+        rmarkdown, htmltools, htmlwidgets, treeio, ggtree, dplyr
+VignetteBuilder: knitr, rmarkdown
+URL: https://github.com/DmitryKarabanov/bGMYC4
+BugReports: https://github.com/DmitryKarabanov/bGMYC4/issues
+RoxygenNote: 8.0.0
+NeedsCompilation: no
+Packaged: 2026-08-24 07:20:13 UTC; Professional
+Author: Noah Reid [aut, cph] (Original author of bGMYC),
+  Dmitry Karabanov [aut, cre] (ORCID:
+    <https://orcid.org/0000-0001-6008-7441>)
+Maintainer: Dmitry Karabanov <dk@ibiw.ru>
+Repository: CRAN
+Date/Publication: 2026-09-04 20:30:02 UTC
