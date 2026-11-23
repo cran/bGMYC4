@@ -1,6 +1,6 @@
 ---
 title: "bGMYC4 Interactive Workflow"
-author: "Dmitry Karabanov & Qwen"
+author: "Dmitry Karabanov"
 date: "`r Sys.Date()`"
 output: rmarkdown::html_vignette
 vignette: >
@@ -40,8 +40,6 @@ library(ggtree)
 library(dplyr)
 library(plotly)
 library(htmlwidgets)
-library(future)
-library(future.apply)
 library(mcmcse)
 
 # EN: Safe numeric scalar input / Безопасный ввод скалярных значений
@@ -64,15 +62,6 @@ input_vector <- function(label, default_vec) {
   nums <- nums[!is.na(nums)]
   if (length(nums) != length(default_vec)) return(default_vec)
   return(nums)
-}
-
-# EN: Enforce ultrametricity / Обеспечение ультраметричности
-fix_ultrametric <- function(tr) {
-  if (!is.ultrametric(tr)) {
-    tr$edge.length <- round(tr$edge.length, 8)
-    if (!is.ultrametric(tr)) stop("❌ Tree remains non-ultrametric / Дерево остаётся неультраметричным.")
-  }
-  return(tr)
 }
 ```
 
@@ -183,27 +172,45 @@ repeat {
 
 ```{r multi}
 if (analysis_mode == 2) {
-  # EN: Parallel execution / Параллельное выполнение
-  n_workers <- min(parallel::detectCores(logical = FALSE) - 1, length(trees_sample))
-  plan(multisession, workers = max(1, n_workers))
+  # EN: bgmyc.multiphylo() uses a parallel PSOCK cluster and returns a
+  #     "multibgmyc" object directly. cores = 1 (default) runs sequentially.
+  #     options(mc.cores = ...) has NO effect here.
+  # RU: bgmyc.multiphylo() использует PSOCK-кластер и сам возвращает объект
+  #     класса "multibgmyc". cores = 1 (по умолчанию) — последовательно.
+  #     options(mc.cores = ...) здесь НЕ действует.
+  # CRAN-safe: at most 2 workers. Locally you may raise it, e.g. cores = 6.
+  final_res <- bgmyc.multiphylo(
+    multiphylo = trees_sample,
+    mcmc = params$mcmc, burnin = params$burnin, thinning = params$thinning,
+    py1 = params$py1, py2 = params$py2, pc1 = params$pc1, pc2 = params$pc2,
+    t1 = params$t1, t2 = params$t2, scale = params$scale, start = params$start,
+    cores = 2, seed = 42
+  )
   
-  final_res <- future_lapply(seq_along(trees_sample), function(i) {
-    bgmyc.singlephy(
-      phylo = trees_sample[[i]], mcmc = params$mcmc, burnin = params$burnin, 
-      thinning = params$thinning, py1 = params$py1, py2 = params$py2, 
-      pc1 = params$pc1, pc2 = params$pc2, t1 = params$t1, t2 = params$t2, 
-      scale = params$scale, start = params$start
-    )
-  }, future.seed = TRUE)
-  class(final_res) <- "multibgmyc"
-  
-  # EN: Gelman-Rubin R-hat / Статистика Гелмана-Рубина
-  if (requireNamespace("mcmcse", quietly = TRUE) && length(final_res) > 1) {
-    chains_list <- lapply(final_res, function(res) res$par[, 3])
-    names(chains_list) <- paste0("Tree_", seq_along(final_res))
-    rhat <- round(mcmcse::gelman(chains_list)$Rhat, 3)
-    cat(sprintf("Gelman-Rubin R-hat: %.3f [Target < 1.05]\n", rhat))
+  # EN: Per-tree diagnostics. R-hat is NOT valid across different trees:
+  #     each posterior tree defines its own conditional posterior.
+  # RU: Диагностика по каждому дереву. R̂ между деревьями невалиден:
+  #     каждое дерево задаёт свой условный апостериор.
+  acc <- t(vapply(final_res, function(r) as.numeric(r$accept)[1:3], numeric(3)))
+  colnames(acc) <- c("py", "pc", "th")
+  cat("Acceptance rates (median across trees): ",
+      paste(sprintf("%s=%.3f", colnames(acc), apply(acc, 2, median)), collapse = " | "),
+      "\n", sep = "")
+
+  if (requireNamespace("mcmcse", quietly = TRUE)) {
+    ess_th <- vapply(final_res, function(r) {
+      e <- tryCatch(as.numeric(mcmcse::ess(r$par[, 3])), error = function(e) NA_real_)
+      if (length(e) != 1L || !is.finite(e)) NA_real_ else e
+    }, numeric(1))
+    if (any(is.finite(ess_th)))
+      cat(sprintf("ESS(threshold): min=%d | median=%d | max=%d [target > 200]\n",
+                  round(min(ess_th, na.rm = TRUE)),
+                  round(median(ess_th, na.rm = TRUE)),
+                  round(max(ess_th, na.rm = TRUE))))
   }
+  cat("Note: for a genuine R-hat, run several independent chains on ONE tree\n",
+      "      with bgmyc.chains() and summarise with bgmyc.convergence().\n", sep = "")
+  
 } else {
   final_res <- list(res_single)
   class(final_res) <- "multibgmyc"
@@ -287,26 +294,33 @@ htmlwidgets::saveWidget(fig_combined, "bGMYC_interactive_heatmap.html", selfcont
 
 ```{r export}
 # EN: Export clusters at different thresholds / Экспорт кластеров на разных порогах
-for (p in c(0.05, 0.01)) {
-  out <- bgmyc.point(probmat, ppcutoff = p)
+thresholds <- c(0.05, 0.01)
+for (p in thresholds) {
+  # EN: single-linkage warning is expected; see README "Choosing ppcutoff".
+  # RU: предупреждение single linkage ожидаемо; см. README "Choosing ppcutoff".
+  out <- suppressWarnings(bgmyc.point(probmat, ppcutoff = p))
   df <- data.frame(
     Sequence = unlist(out),
     MOTU_bGMYC = rep(seq_along(out), lengths(out)),
     stringsAsFactors = FALSE
   )
-  write.table(df, file = sprintf("Delimitation_bGMYC_%.2f.csv", p),
-              row.names = FALSE, sep = ";", dec = ".", quote = FALSE, fileEncoding = "UTF-8")
+  fname <- sprintf("Delimitation_bGMYC_%.3f.csv", p)
+  utils::write.table(df, file = fname,
+                     row.names = FALSE, sep = ";", dec = ".", quote = FALSE)
+  cat(sprintf("✅ ppcutoff=%.3f → %d clusters → %s\n", p, length(out), fname))
 }
 
 # EN: Export full probability matrix / Экспорт полной матрицы вероятностей
 spec_out <- bgmyc.spec(final_res)
-write.csv(spec_out$specprobs, "bGMYC_full_probs.csv", row.names = FALSE)
+utils::write.csv(spec_out$specprobs, "bGMYC_full_probs.csv", row.names = FALSE)
+cat("✅ bGMYC_full_probs.csv saved\n")
 ```
 ---
 
 ## ⚡ Performance & Export / Производительность и экспорт    
-**EN:** bgmyc.multiphylo() automatically parallelizes across physical CPU cores. To limit cores (e.g., to 6), run before analysis: options(mc.cores = 6).    
-**RU:** bgmyc.multiphylo() автоматически использует все физические ядра. Чтобы ограничить число ядер (например, до 6), выполните перед запуском: options(mc.cores = 6).    
+**EN:** `bgmyc.multiphylo()` runs sequentially by default (`cores = 1`). To use several workers, pass the `cores` argument, e.g. `bgmyc.multiphylo(trees, ..., cores = 6, seed = 42)`. Note that `options(mc.cores = ...)` has no effect here: the package uses a PSOCK cluster via `parallel::makeCluster()`, not `mclapply()`.    
+**RU:** `bgmyc.multiphylo()` по умолчанию выполняется последовательно (`cores = 1`). Чтобы задействовать несколько воркеров, передайте аргумент `cores`, например `bgmyc.multiphylo(trees, ..., cores = 6, seed = 42)`. Обратите внимание: `options(mc.cores = ...)` здесь не действует — пакет использует PSOCK-кластер через `parallel::makeCluster()`, а не `mclapply()`.    
+
 ---
 
 ## 📊 Parameter Reference Guide / Справочник по параметрам
@@ -319,7 +333,7 @@ write.csv(spec_out$specprobs, "bGMYC_full_probs.csv", row.names = FALSE)
 | `pc1`, `pc2` | Coalescent prior / Априор коалесценции | `0`, `1.0–2.0` | Models `Ne` change. `pc < 1` → decline, `pc > 1` → growth. / Моделирует динамику эффективного размера популяции. |
 | `t1`, `t2` | Threshold prior (species count) / Априор числа видов | `2`, `min(35, ntips-5)` | Must be `< ntips`. Auto-capped to prevent crashes. / Строго `< числа таксонов`. |
 | `scale` | Proposal step widths / Ширина предложений MCMC | `c(20–30, 10–15, 3–7)` | Higher = more conservative. Tune via acceptance rates. / Выше = консервативнее. Настраивается по acceptance rates. |
-| `ppcutoff` | Lumping threshold / Порог объединения | `0.05` (variable), `0.95` (strict) | Low = captures high intraspecific variation/ILS. / Низкий = учитывает высокую внутривидовую изменчивость. |
+| ppcutoff | Lumping threshold / Порог объединения | `0.05` (default), sweep `0.001–0.9` | EN: single linkage — species held together by weakest link; look for stability plateau. RU: single linkage — вид держится слабейшим звеном; ищите плато стабильности. |
 
 ---
 
@@ -346,6 +360,11 @@ write.csv(spec_out$specprobs, "bGMYC_full_probs.csv", row.names = FALSE)
 - Всегда запускайте диагностику на 1 дереве перед переходом к `multiPhylo`.    
 
 ---
-**References / Ссылки:** Pons et al. 2006 *Syst. Biol.* 55:595; Reid & Carstens 2012 *Mol. Ecol. Res.* 12:446.
-
-`vignette("bGMYC4-interactive", package = "bGMYC4")`
+**References / Ссылки:**
+- Pons J, Barraclough TG, Gomez-Zurita J, et al. (2006) Sequence-based species
+  delimitation for the DNA taxonomy of undescribed insects. *Systematic Biology*
+  55(4):595–609. doi:10.1080/10635150600852011
+- Reid NM, Carstens BC (2012) Phylogenetic estimation error can decrease the
+  accuracy of species delimitation: a Bayesian implementation of the general
+  mixed Yule-coalescent model. *BMC Evolutionary Biology* 12:196.
+  doi:10.1186/1471-2148-12-196

@@ -19,8 +19,6 @@ knitr::opts_chunk$set(
 # library(dplyr)
 # library(plotly)
 # library(htmlwidgets)
-# library(future)
-# library(future.apply)
 # library(mcmcse)
 # 
 # # EN: Safe numeric scalar input / Безопасный ввод скалярных значений
@@ -43,15 +41,6 @@ knitr::opts_chunk$set(
 #   nums <- nums[!is.na(nums)]
 #   if (length(nums) != length(default_vec)) return(default_vec)
 #   return(nums)
-# }
-# 
-# # EN: Enforce ultrametricity / Обеспечение ультраметричности
-# fix_ultrametric <- function(tr) {
-#   if (!is.ultrametric(tr)) {
-#     tr$edge.length <- round(tr$edge.length, 8)
-#     if (!is.ultrametric(tr)) stop("❌ Tree remains non-ultrametric / Дерево остаётся неультраметричным.")
-#   }
-#   return(tr)
 # }
 
 ## ----data---------------------------------------------------------------------
@@ -141,27 +130,45 @@ knitr::opts_chunk$set(
 
 ## ----multi--------------------------------------------------------------------
 # if (analysis_mode == 2) {
-#   # EN: Parallel execution / Параллельное выполнение
-#   n_workers <- min(parallel::detectCores(logical = FALSE) - 1, length(trees_sample))
-#   plan(multisession, workers = max(1, n_workers))
+#   # EN: bgmyc.multiphylo() uses a parallel PSOCK cluster and returns a
+#   #     "multibgmyc" object directly. cores = 1 (default) runs sequentially.
+#   #     options(mc.cores = ...) has NO effect here.
+#   # RU: bgmyc.multiphylo() использует PSOCK-кластер и сам возвращает объект
+#   #     класса "multibgmyc". cores = 1 (по умолчанию) — последовательно.
+#   #     options(mc.cores = ...) здесь НЕ действует.
+#   # CRAN-safe: at most 2 workers. Locally you may raise it, e.g. cores = 6.
+#   final_res <- bgmyc.multiphylo(
+#     multiphylo = trees_sample,
+#     mcmc = params$mcmc, burnin = params$burnin, thinning = params$thinning,
+#     py1 = params$py1, py2 = params$py2, pc1 = params$pc1, pc2 = params$pc2,
+#     t1 = params$t1, t2 = params$t2, scale = params$scale, start = params$start,
+#     cores = 2, seed = 42
+#   )
 # 
-#   final_res <- future_lapply(seq_along(trees_sample), function(i) {
-#     bgmyc.singlephy(
-#       phylo = trees_sample[[i]], mcmc = params$mcmc, burnin = params$burnin,
-#       thinning = params$thinning, py1 = params$py1, py2 = params$py2,
-#       pc1 = params$pc1, pc2 = params$pc2, t1 = params$t1, t2 = params$t2,
-#       scale = params$scale, start = params$start
-#     )
-#   }, future.seed = TRUE)
-#   class(final_res) <- "multibgmyc"
+#   # EN: Per-tree diagnostics. R-hat is NOT valid across different trees:
+#   #     each posterior tree defines its own conditional posterior.
+#   # RU: Диагностика по каждому дереву. R̂ между деревьями невалиден:
+#   #     каждое дерево задаёт свой условный апостериор.
+#   acc <- t(vapply(final_res, function(r) as.numeric(r$accept)[1:3], numeric(3)))
+#   colnames(acc) <- c("py", "pc", "th")
+#   cat("Acceptance rates (median across trees): ",
+#       paste(sprintf("%s=%.3f", colnames(acc), apply(acc, 2, median)), collapse = " | "),
+#       "\n", sep = "")
 # 
-#   # EN: Gelman-Rubin R-hat / Статистика Гелмана-Рубина
-#   if (requireNamespace("mcmcse", quietly = TRUE) && length(final_res) > 1) {
-#     chains_list <- lapply(final_res, function(res) res$par[, 3])
-#     names(chains_list) <- paste0("Tree_", seq_along(final_res))
-#     rhat <- round(mcmcse::gelman(chains_list)$Rhat, 3)
-#     cat(sprintf("Gelman-Rubin R-hat: %.3f [Target < 1.05]\n", rhat))
+#   if (requireNamespace("mcmcse", quietly = TRUE)) {
+#     ess_th <- vapply(final_res, function(r) {
+#       e <- tryCatch(as.numeric(mcmcse::ess(r$par[, 3])), error = function(e) NA_real_)
+#       if (length(e) != 1L || !is.finite(e)) NA_real_ else e
+#     }, numeric(1))
+#     if (any(is.finite(ess_th)))
+#       cat(sprintf("ESS(threshold): min=%d | median=%d | max=%d [target > 200]\n",
+#                   round(min(ess_th, na.rm = TRUE)),
+#                   round(median(ess_th, na.rm = TRUE)),
+#                   round(max(ess_th, na.rm = TRUE))))
 #   }
+#   cat("Note: for a genuine R-hat, run several independent chains on ONE tree\n",
+#       "      with bgmyc.chains() and summarise with bgmyc.convergence().\n", sep = "")
+# 
 # } else {
 #   final_res <- list(res_single)
 #   class(final_res) <- "multibgmyc"
@@ -232,18 +239,24 @@ knitr::opts_chunk$set(
 
 ## ----export-------------------------------------------------------------------
 # # EN: Export clusters at different thresholds / Экспорт кластеров на разных порогах
-# for (p in c(0.05, 0.01)) {
-#   out <- bgmyc.point(probmat, ppcutoff = p)
+# thresholds <- c(0.05, 0.01)
+# for (p in thresholds) {
+#   # EN: single-linkage warning is expected; see README "Choosing ppcutoff".
+#   # RU: предупреждение single linkage ожидаемо; см. README "Choosing ppcutoff".
+#   out <- suppressWarnings(bgmyc.point(probmat, ppcutoff = p))
 #   df <- data.frame(
 #     Sequence = unlist(out),
 #     MOTU_bGMYC = rep(seq_along(out), lengths(out)),
 #     stringsAsFactors = FALSE
 #   )
-#   write.table(df, file = sprintf("Delimitation_bGMYC_%.2f.csv", p),
-#               row.names = FALSE, sep = ";", dec = ".", quote = FALSE, fileEncoding = "UTF-8")
+#   fname <- sprintf("Delimitation_bGMYC_%.3f.csv", p)
+#   utils::write.table(df, file = fname,
+#                      row.names = FALSE, sep = ";", dec = ".", quote = FALSE)
+#   cat(sprintf("✅ ppcutoff=%.3f → %d clusters → %s\n", p, length(out), fname))
 # }
 # 
 # # EN: Export full probability matrix / Экспорт полной матрицы вероятностей
 # spec_out <- bgmyc.spec(final_res)
-# write.csv(spec_out$specprobs, "bGMYC_full_probs.csv", row.names = FALSE)
+# utils::write.csv(spec_out$specprobs, "bGMYC_full_probs.csv", row.names = FALSE)
+# cat("✅ bGMYC_full_probs.csv saved\n")
 

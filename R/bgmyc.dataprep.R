@@ -1,8 +1,26 @@
+#' Prepare an ultrametric tree for GMYC analysis
+#'
+#' Decomposes the tree into waiting times between branching events and, for
+#' every possible threshold, precomputes lineage-count (`list.i.mat`) and
+#' event-count (`list.s.nod`) matrices for the Yule and coalescent processes.
+#'
+#' @param tr An `ape` `"phylo"` object: ultrametric, fully bifurcating, no
+#'   zero-length terminal branches.
+#' @return A list:
+#'   \item{mrca.nodes}{MRCA node indices (node number minus number of tips) per threshold.}
+#'   \item{nod.types}{Node types per threshold: 0 = Yule, 1 = coalescent, 2 = species MRCA.}
+#'   \item{n}{Number of coalescent processes (multi-tip species) per threshold.}
+#'   \item{list.s.nod}{Event-count matrices per threshold.}
+#'   \item{list.i.mat}{Lineage-count matrices per threshold (coalescent rows: n(n-1)).}
+#'   \item{internod}{Waiting times between successive branching events (last: to present).}
+#'   \item{tree}{The input tree.}
+#' @export
 bgmyc.dataprep <- function(tr) {
-  if (!is.ultrametric(tr)) {
-    stop("Your input tree is not ultrametric. This method requires that trees be ultrametric.")
+  if (!ape::is.ultrametric(tr)) {
+    stop("Your input tree is not ultrametric. This method requires that trees be ultrametric. ",
+         "If this is rounding noise from BEAST, try fix_ultrametric(tr) first.")
   }
-  if (!is.binary(tr)) {
+  if (!ape::is.binary(tr)) {
     stop("Your input tree is not fully bifurcating, please resolve with zero branch lengths.")
   }
   if (0 %in% tr$edge.length[which(tr$edge[,2] <= length(tr$tip.label))]) {
@@ -10,26 +28,19 @@ bgmyc.dataprep <- function(tr) {
   }
 
   numtip <- length(tr$tip.label)
+  if (numtip < 3) stop("GMYC requires at least 3 tips.")
   numnod <- tr$Nnode
-  numall <- numnod + numtip
 
   # Calculating branching times directly
-  bt <- -branching.times(tr)
+  bt <- -ape::branching.times(tr)
   bt[bt > -1e-06] <- -1e-06
   names(bt) <- NULL
   sb <- sort(bt)
   nthresh <- numnod
-  internod <- sb[2:numnod] - sb[1:(numnod - 1)]
+  internod <- sb[seq(2, numnod)] - sb[seq_len(numnod - 1)]
   internod[numnod] <- 0 - sb[numnod]
 
-  # Tree traversal functions
-  get_nesting <- function(x) {
-    if (x < numtip + 2) return(integer(0))
-    anc <- as.integer(tr$edge[tr$edge[, 2] == x, 1])
-    if (length(anc) == 0) return(integer(0))
-    if (anc >= numtip + 2) c(anc, get_nesting(anc)) else anc
-  }
-
+  # Internal descendants of every node (ancestors are not needed by the model)
   get_nested <- function(x) {
     desc <- as.integer(tr$edge[tr$edge[, 1] == x, 2])
     if (length(desc) == 0) return(integer(0))
@@ -40,17 +51,15 @@ bgmyc.dataprep <- function(tr) {
     res
   }
 
-  # Preallocating lists
-  nesting <- vector("list", numnod)
   nested <- vector("list", numnod)
   for (i in seq_len(numnod)) {
-    idx <- i + numtip
-    nesting[[i]] <- get_nesting(idx)
-    nested[[i]]  <- get_nested(idx)
+    nested[[i]] <- get_nested(i + numtip)
   }
 
-  ancs <- cbind(tr$edge[pmatch((1:numnod + numtip), tr$edge[, 2]), 1], (1:numnod + numtip))
+  # Parent/child branching times. The root has no parent: -Inf = older than any threshold.
+  ancs <- cbind(tr$edge[match((1:numnod + numtip), tr$edge[, 2]), 1], (1:numnod + numtip))
   bt.ancs <- cbind(bt[ancs[, 1] - numtip], bt[ancs[, 2] - numtip])
+  bt.ancs[1, 1] <- -Inf
 
   # Preallocation of basic data structures
   mrca.nodes <- vector("list", nthresh)
@@ -58,20 +67,19 @@ bgmyc.dataprep <- function(tr) {
   n_vec      <- vector("list", nthresh)
   list.i.mat <- vector("list", nthresh)
   list.s.nod <- vector("list", nthresh)
-  nod_list   <- vector("list", nthresh)
 
   ord_bt <- order(bt)
 
-  for (j in 2:nthresh) {
+  for (j in seq(2, nthresh)) {
     threshy <- sb[j]
     tmp <- (bt.ancs[, 1] < threshy) & (bt.ancs[, 2] >= threshy)
     nod.type <- tmp + (bt >= threshy)
-    
+
     mrca_idx <- which(nod.type == 2)
     mrca.nodes[[j]] <- mrca_idx
     if (nod.type[1] == 1) nod.type[1] <- 2
     nod.types[[j]] <- nod.type
-    
+
     n_val <- length(mrca_idx)
     n_vec[[j]] <- n_val
 
@@ -80,12 +88,11 @@ bgmyc.dataprep <- function(tr) {
     list.i.mat[[j]] <- matrix(0, nrow = n_val + 1, ncol = numnod)
 
     nod_j <- nod.type[ord_bt]
-    nod_list[[j]] <- nod_j
 
     for (i in seq_len(n_val)) {
       m_idx <- mrca_idx[i]
       list.s.nod[[j]][i, m_idx] <- 2
-      
+
       if (!is.null(nested[[m_idx]])) {
         nested_idx <- nested[[m_idx]] - numtip
         list.s.nod[[j]][i, nested_idx] <- 1
@@ -93,7 +100,7 @@ bgmyc.dataprep <- function(tr) {
       list.s.nod[[j]][i, ] <- list.s.nod[[j]][i, ord_bt]
 
       # Vectorized filling
-      mask <- ifelse(list.s.nod[[j]][i, ] == 2, 2, 
+      mask <- ifelse(list.s.nod[[j]][i, ] == 2, 2,
                      ifelse(list.s.nod[[j]][i, ] == 1, 1, 0))
       list.i.mat[[j]][i, ] <- cumsum(mask)
     }

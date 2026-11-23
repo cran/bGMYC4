@@ -1,11 +1,8 @@
 #═══════════════════════════════════════════════════════════════
-#bGMYC4 v4.1.0: Полный интерактивный пайплайн
+#bGMYC4 v4.3.1: Полный интерактивный пайплайн
 #(параметры -> тест -> мульти/сингл -> визуализация с posterior-colored деревом)
 #═══════════════════════════════════════════════════════════════
 
-library(ape)
-library(future)
-library(future.apply)
 library(mcmcse)
 library(plotly)
 library(base64enc)
@@ -13,6 +10,7 @@ library(htmlwidgets)
 library(treeio)
 library(dplyr)
 library(ggtree)
+library(ape)
 library(bGMYC4)
 
 cat("✅ Все критичные зависимости загружены\n")
@@ -26,8 +24,8 @@ if (!file.exists(consensus_path)) stop("❌ Консенсусное дерев�
 if (!file.exists(posterior_path)) stop("❌ Файл с деревьями не найден!")
 
 DELIM_DIR <- dirname(consensus_path)
-html_path <- file.path(OUT_DIR, "bGMYC_interactive_heatmap.html")
-cat(sprintf("💾 Результаты будут сохранены в: %s\n", OUT_DIR))
+html_path <- file.path(DELIM_DIR, "bGMYC_interactive_heatmap.html")
+cat(sprintf("💾 Результаты будут сохранены в: %s\n", DELIM_DIR))
 
 # Используем treeio::read.beast() для извлечения posterior из Nexus-аннотаций
 tree_beast <- read.beast(consensus_path)
@@ -73,13 +71,6 @@ if (analysis_mode == 2) {
 }
 
 # 4. ПРОВЕРКА УЛЬТРАМЕТРИЧНОСТИ
-fix_ultrametric <- function(tr) {
-  if (!is.ultrametric(tr)) {
-    tr$edge.length <- round(tr$edge.length, 8)
-    if (!is.ultrametric(tr)) stop("❌ Дерево остаётся неультраметричным после округления ветвей.\n")
-  }
-  tr
-}
 
 cat("📐 Проверка ультраметричности...\n")
 tree <- fix_ultrametric(tree)
@@ -206,7 +197,7 @@ repeat {
   cat("👀 Закройте окно графиков для анализа сходимости...\n")
   Sys.sleep(1); flush.console()
   
-# 🟢 ДИНАМИЧЕСКАЯ АНАЛИТИКА СХОДИМОСТИ 
+  # 🟢 ДИНАМИЧЕСКАЯ АНАЛИТИКА СХОДИМОСТИ 
   ar <- res_single$accept
   cat(sprintf("\n📊 Acceptance rates: py=%.3f | pc=%.3f | th=%.3f\n", ar[1], ar[2], ar[3]))
   
@@ -222,19 +213,6 @@ repeat {
   recs <- character(0)
   param_names <- c("py", "pc", "th")
   
-  for (i in 1:3) {
-    if (ar[i] > 0.55) {
-      new_val <- round(params$scale[i] * 1.5)
-      if (new_val == params$scale[i]) new_val <- params$scale[i] + (if(i < 3) 5 else 2)
-      recs <- c(recs, sprintf("• %s: слишком высокая (%.2f) → увеличьте scale[%d] с %g до ~%d",
-                              param_names[i], ar[i], i, params$scale[i], new_val))
-    } else if (ar[i] < 0.15) {
-      new_val <- max(if(i < 3) 2 else 1, round(params$scale[i] * 0.5))
-      recs <- c(recs, sprintf("• %s: слишком низкая (%.2f) → уменьшите scale[%d] с %g до ~%d",
-                              param_names[i], ar[i], i, params$scale[i], new_val))
-    }
-  }
-  
   if (!is.null(ess_vals) && any(ess_vals < 200)) {
     recs <- c(recs, "• ↑ mcmc или ↓ thinning (ESS < 200: цепь требует больше независимых шагов)")
   }
@@ -246,7 +224,6 @@ repeat {
   } else {
     cat("✅ Сходимость цепи стабильна. Параметры оптимальны.\n")
   }
-  
 
   next_prompt <- if (analysis_mode == 1) {
     "⏭️  Перейти к финальному выводу (y) или изменить параметры (n)? [y/n]: "
@@ -280,6 +257,70 @@ repeat {
   cat(sprintf("🔒 Параметры обновлены: t ∈ [%d, %d] | start[3] = %d\n\n", params$t1, params$t2, params$start[3]))
 }
 
+#═══════════════════════════════════════════════════════════════
+# 7.5. НАСТОЯЩИЙ Gelman-Rubin R̂ (несколько цепей на ОДНОМ дереве)
+#═══════════════════════════════════════════════════════════════
+
+n_chains_run <- 4L
+
+cat(sprintf("\n📐 Запуск %d независимых цепей (dispersed start) для R̂...\n", n_chains_run))
+
+chain_runs <- bgmyc.chains(
+  phylo = tree,
+  mcmc = params$mcmc,
+  burnin = params$burnin,
+  thinning = params$thinning,
+  py1 = params$py1, py2 = params$py2,
+  pc1 = params$pc1, pc2 = params$pc2,
+  t1 = params$t1, t2 = params$t2,
+  scale = params$scale,
+  start = params$start,
+  nchains = n_chains_run,
+  seed = 42,
+  cores = max(1L, min(n_chains_run, parallel::detectCores(logical = FALSE) - 1L)),
+  dispersed = TRUE
+)
+
+conv <- bgmyc.convergence(chain_runs)
+
+cat("\n=== Краткая сводка bgmyc.convergence() ===\n")
+print(conv$summary)
+
+cat("\n=== R̂ по параметрам ===\n")
+print(round(conv$rhat, 3))
+
+cat("\n=== ESS по параметрам ===\n")
+print(round(conv$ess_total, 0))
+
+cat("\n=== Acceptance rates по цепям ===\n")
+print(round(conv$per_chain_accept, 3))
+
+# Проверка целей
+rhat_ok <- all(conv$rhat <= 1.05, na.rm = TRUE)
+ess_ok  <- all(conv$ess_total >= 200, na.rm = TRUE)
+
+cat("\n=== Итог диагностики ===\n")
+if (rhat_ok) {
+  cat("✅ Split-R̂: все значения <= 1.05.\n")
+} else {
+  bad_rhat <- names(conv$rhat)[conv$rhat > 1.05]
+  cat(sprintf("⚠️  Split-R̂ > 1.05 у параметров: %s\n",
+              paste(bad_rhat, collapse = ", ")))
+  cat("   Увеличьте mcmc/burnin или подстройте scale.\n")
+}
+
+if (ess_ok) {
+  cat("✅ ESS: все значения >= 200.\n")
+} else {
+  bad_ess <- names(conv$ess_total)[conv$ess_total < 200]
+  cat(sprintf("⚠️  ESS < 200 у параметров: %s\n",
+              paste(bad_ess, collapse = ", ")))
+  cat("   Увеличьте mcmc или уменьшите thinning.\n")
+}
+
+cat("\nℹ️  Число цепей смотрите не по length(chain_runs), а по nrow(conv$per_chain_ess).\n")
+cat(sprintf("   Цепей фактически: %d\n", nrow(conv$per_chain_ess)))
+
 # 8. ПОДГОТОВКА ФИНАЛЬНЫХ РЕЗУЛЬТАТОВ
 if (analysis_mode == 1) {
   cat("\n🌲 Анализ на одном дереве завершён. Формирую выводы...\n")
@@ -287,98 +328,94 @@ if (analysis_mode == 1) {
   class(final_res) <- "multibgmyc"
 } else {
   cat("\n⚡ Запуск bgmyc.multiphylo на выбранных деревьях...\n")
-  
   n_physical <- parallel::detectCores(logical = FALSE)
-  n_workers <- min(n_physical - 1, n_sample)
-  if (n_workers < 1) n_workers <- 1
-  
+  n_workers <- max(1L, min(n_physical - 1, n_sample))
   cat(sprintf("   Воркеры: %d (физических ядер: %d)\n", n_workers, n_physical))
   
-  plan(multisession, workers = n_workers)
-  
-  final_res <- future_lapply(seq_along(trees_sample), function(i) {
-    bgmyc.singlephy(
-      phylo = trees_sample[[i]],
-      mcmc = params$mcmc, burnin = params$burnin, thinning = params$thinning,
-      py1 = params$py1, py2 = params$py2, pc1 = params$pc1, pc2 = params$pc2,
-      t1 = params$t1, t2 = params$t2, scale = params$scale, start = params$start
-    )
-  }, future.seed = TRUE)
-  
-  class(final_res) <- "multibgmyc"
+  final_res <- bgmyc.multiphylo(
+    multiphylo = trees_sample,
+    mcmc = params$mcmc, burnin = params$burnin, thinning = params$thinning,
+    py1 = params$py1, py2 = params$py2, pc1 = params$pc1, pc2 = params$pc2,
+    t1 = params$t1, t2 = params$t2, scale = params$scale, start = params$start,
+    cores = n_workers, seed = 42
+  )
   cat("✅ Все деревья успешно обработаны.\n")
   
-  if (requireNamespace("mcmcse", quietly = TRUE) && length(final_res) > 1) {
-    cat("\n📐 Расчёт Gelman-Rubin (R̂) across tree chains...\n")
-    
-    chains_list <- lapply(final_res, function(res) res$par[, 3])
-    names(chains_list) <- paste0("Tree_", seq_along(final_res))
-    
-    gr_result <- tryCatch(mcmcse::gelman(chains_list), error = function(e) NULL)
-    
-    if (!is.null(gr_result)) {
-      rhat <- round(gr_result$Rhat, 3)
-      cat(sprintf("🔍 Gelman-Rubin R̂ (threshold): %.3f [Оптимум: < 1.05]\n", rhat))
-      
-      if (rhat > 1.05) {
-        cat("⚠️  R̂ > 1.05: цепи показывают расхождение. Увеличьте mcmc/burnin или проверьте топологии деревьев.\n")
+  # 📐 Per-tree diagnostics / Диагностика по каждому дереву
+  cat("\n📐 Диагностика по каждому дереву (per-tree)...\n")
+  acc <- t(vapply(final_res, function(r) as.numeric(r$accept)[1:3], numeric(3)))
+  colnames(acc) <- c("py", "pc", "th")
+  cat("   Acceptance rates (медиана по деревьям): ",
+      paste(sprintf("%s=%.3f", colnames(acc), apply(acc, 2, median)), collapse = " | "),
+      "\n", sep = "")
+  
+  if (requireNamespace("mcmcse", quietly = TRUE)) {
+    ess_th <- vapply(final_res, function(r) {
+      e <- tryCatch(as.numeric(mcmcse::ess(r$par[, 3])), error = function(e) NA_real_)
+      if (length(e) != 1L || !is.finite(e)) NA_real_ else e
+    }, numeric(1))
+    if (any(is.finite(ess_th))) {
+      cat(sprintf("   ESS(threshold): min=%d | median=%d | max=%d  [цель: >200]\n",
+                  round(min(ess_th, na.rm = TRUE)),
+                  round(median(ess_th, na.rm = TRUE)),
+                  round(max(ess_th, na.rm = TRUE))))
+      bad <- which(is.finite(ess_th) & ess_th < 200)
+      if (length(bad)) {
+        cat(sprintf("   ⚠️  ESS < 200 у %d дерев(ьев): %s — увеличьте mcmc или уменьшите thinning.\n",
+                    length(bad), paste(head(bad, 10), collapse = ", ")))
       } else {
-        cat("✅ Цепи сошлись стабильно across posterior trees.\n")
+        cat("   ✅ ESS достаточен у всех деревьев.\n")
       }
+    } else {
+      cat("   ⚠️  ESS рассчитать не удалось (цепи слишком короткие).\n")
     }
+  } else {
+    cat("   ⚠️  ESS: пакет 'mcmcse' не установлен — install.packages('mcmcse')\n")
   }
+  
 }
 
-# 9. ВИЗУАЛИЗАЦИЯ И АВТОМАТИЧЕСКИЙ ЭКСПОРТ CSV 
-cat("\n🌡️ Построение интерактивной карты вероятностей (CoMa-style)...\n")
+
+#═══════════════════════════════════════════════════════════════
+# 9. ВИЗУАЛИЗАЦИЯ И АВТОМАТИЧЕСКИЙ ЭКСПОРТ (КАК В РАБОЧЕМ ПРИМЕРЕ)
+#═══════════════════════════════════════════════════════════════
+cat("\n🌡️ Построение интерактивной карты вероятностей...\n")
 probmat <- spec.probmat(final_res)
 
-# Получаем порядок кончиков из дерева
+# ── Округление матрицы ──
+probmat <- round(probmat, 4)
+
 p_tree <- suppressWarnings(ggtree(tree, layout = "rectangular"))
 tips_data <- p_tree$data %>% dplyr::filter(isTip) %>% dplyr::arrange(y)
 tip_order <- tips_data$label
 n_tips <- length(tip_order)
 
-# Перестраиваем матрицу под порядок дерева
 if (!all(rownames(probmat) == tip_order) || !all(colnames(probmat) == tip_order)) {
   probmat <- probmat[tip_order, tip_order]
 }
 
-#  КАСТОМНАЯ ВИЗУАЛИЗАЦИЯ (дерево + матрица) 
-
 cat("\n🎨 Создание кастомной визуализации с деревом (1:1)...\n")
 
-# Если tree_beast не был загружен ранее, читаем его через treeio
 if (!exists("tree_beast") || !inherits(tree_beast, "treedata")) {
   tree_beast <- treeio::read.beast(consensus_path)
 }
 
-# Получаем порядок кончиков из дерева
+if(!is.null(tree$edge.length)) tree$edge.length[tree$edge.length < 0] <- 0
+options(ignore.negative.edge = TRUE)
 p_tree_raw <- suppressWarnings(ggtree(tree, layout = "rectangular"))
 tree_data_raw <- p_tree_raw$data
 tips_data_raw <- tree_data_raw %>% dplyr::filter(isTip) %>% dplyr::arrange(y)
 tip_order <- tips_data_raw$label
-n_tips_tree <- length(tip_order)
 
-cat(sprintf("   Таксонов в дереве: %d\n", n_tips_tree))
-cat(sprintf("   Таксонов в probmat: %d\n", nrow(probmat)))
-
-# Находим пересечение таксонов между деревом и матрицей
 common_taxa <- intersect(tip_order, rownames(probmat))
-cat(sprintf("   Общие таксоны: %d\n", length(common_taxa)))
+if (length(common_taxa) == 0) stop("❌ Нет общих таксонов между деревом и матрицей!")
 
-if (length(common_taxa) == 0) {
-  stop("❌ Нет общих таксонов между деревом и матрицей вероятностей!")
-}
-
-# Фильтруем дерево только по общим таксонам, сохраняя аннотации через treeio
 tips_to_drop <- setdiff(tree_beast@phylo$tip.label, common_taxa)
 if(length(tips_to_drop) > 0) {
   tree_beast_filtered <- treeio::drop.tip(tree_beast, tips_to_drop)
 } else {
   tree_beast_filtered <- tree_beast
 }
-tree_filtered <- tree_beast_filtered@phylo
 
 p_tree <- suppressWarnings(ggtree(tree_beast_filtered, layout = "rectangular"))
 tree_data <- p_tree$data
@@ -386,23 +423,20 @@ tips_data <- tree_data %>% dplyr::filter(isTip) %>% dplyr::arrange(y)
 tip_order <- tips_data$label
 n_tips <- length(tip_order)
 
-# Фильтруем и переупорядочиваем матрицу
 probmat <- probmat[tip_order, tip_order]
-
 cat(sprintf("   ✅ Матрица %d×%d синхронизирована с деревом\n", n_tips, n_tips))
 
-# Извлекаем posterior из аннотаций tree_data
+# Извлекаем posterior
 post_col <- intersect(c("posterior", "prob", "Posterior", "PROB"), colnames(tree_data))
 if(length(post_col) > 0) {
   post_col <- post_col[1]
   node_posterior <- tree_data[[post_col]]
   names(node_posterior) <- tree_data$node
 } else {
-  # Фоллбэк: парсим из label (если вдруг read.nexus оставил их там)
   node_posterior <- sapply(tree_data$label, function(lbl) {
-    if(is.na(lbl) || lbl == "") return(NA_real_)
+    if(is.na(lbl) || lbl == " ") return(NA_real_)
     m <- regmatches(lbl, regexpr("(posterior|prob)\\s*=\\s*([0-9\\.eE\\-]+)", lbl, ignore.case = TRUE, perl = TRUE))
-    if(length(m) == 0 || m == "") return(NA_real_)
+    if(length(m) == 0) return(NA_real_)
     num_str <- sub("^(posterior|prob)\\s*=\\s*", "", m, ignore.case = TRUE, perl = TRUE)
     val <- as.numeric(num_str)
     if(!is.na(val) && val > 1) val <- val / 100
@@ -411,36 +445,19 @@ if(length(post_col) > 0) {
   names(node_posterior) <- tree_data$node
 }
 
-
-# ДЕРЕВО (левая часть)
-
 edges <- tree_data %>% dplyr::filter(!is.na(parent))
 
-fig_tree <- plotly::plot_ly()
-
-# Функция цвета: плавный градиент через несколько контрольных точек
-# Красный (0) -> Оранжевый (0.25) -> Жёлтый (0.5) -> Светло-зелёный (0.75) -> Зелёный (1.0)
 get_pp_color <- function(pp) {
-  if(is.na(pp)) return("#CCCCCC") # Серый для NA
+  if(is.na(pp)) return("#CCCCCC")
   pp <- max(0, min(1, pp))
-  
-  # Определяем контрольные точки градиента
   colors <- list(
-    c(0.0, 1.0, 0.0, 0.0),    # Красный
-    c(0.25, 1.0, 0.5, 0.0),   # Оранжевый
-    c(0.5, 1.0, 1.0, 0.0),    # Жёлтый
-    c(0.75, 0.5, 1.0, 0.0),   # Светло-зелёный
-    c(1.0, 0.0, 0.7, 0.0)     # Зелёный
+    c(0.0, 1.0, 0.0, 0.0), c(0.25, 1.0, 0.5, 0.0), c(0.5, 1.0, 1.0, 0.0),
+    c(0.75, 0.5, 1.0, 0.0), c(1.0, 0.0, 0.7, 0.0)
   )
-  
-  # Находим два ближайших контрольных точки
   if(pp <= 0) return(sprintf("#%02X%02X%02X", 255, 0, 0))
   if(pp >= 1) return(sprintf("#%02X%02X%02X", 0, 179, 0))
-  
-  # Интерполяция между контрольными точками
   for(i in 1:(length(colors)-1)) {
     if(pp >= colors[[i]][1] && pp <= colors[[i+1]][1]) {
-      # Линейная интерполяция между двумя точками
       t <- (pp - colors[[i]][1]) / (colors[[i+1]][1] - colors[[i]][1])
       r <- colors[[i]][2] + t * (colors[[i+1]][2] - colors[[i]][2])
       g <- colors[[i]][3] + t * (colors[[i+1]][3] - colors[[i]][3])
@@ -448,175 +465,238 @@ get_pp_color <- function(pp) {
       return(sprintf("#%02X%02X%02X", round(r*255), round(g*255), round(b*255)))
     }
   }
-  
   return("#CCCCCC")
 }
 
-for(i in 1:nrow(edges)) {
-  child <- edges[i, ]
-  parent <- tree_data %>% dplyr::filter(node == child$parent)
-  if(nrow(parent) == 0) next
-  
-  # Определяем цвет ветви по posterior дочернего узла
-  child_node <- as.character(child$node)
-  pp <- node_posterior[child_node]
-  branch_color <- get_pp_color(pp)
-  
-  # Hover текст
-  pp_text <- ifelse(is.na(pp), "N/A", sprintf("%.2f", pp))
-  hover_txt <- paste0("<b>Node:</b> ", child$node, "<br>",
-                      "<b>Posterior:</b> ", pp_text)
-  
-  # Ветви (ширина 5)
-  fig_tree <- fig_tree %>% plotly::add_segments(
-    x = parent$x, xend = child$x, y = child$y, yend = child$y,
-    line = list(color = branch_color, width = 5), hovertext = hover_txt, hoverinfo = "text", showlegend = FALSE)
-  fig_tree <- fig_tree %>% plotly::add_segments(
-    x = parent$x, xend = parent$x, y = parent$y, yend = child$y,
-    line = list(color = branch_color, width = 5), hovertext = hover_txt, hoverinfo = "text", showlegend = FALSE)
+# Цветовая шкала для ТЕПЛОВОЙ КАРТЫ (PP conspecific) — бело-зелёная
+custom_colorscale_heat <- list(
+  c(0.00, "#F0FFFF"),  # Почти белый (низкая вероятность)
+  c(0.25, "#BDECB6"),  # Светло-зелёный
+  c(0.50, "#98FB98"),  # Средне-зелёный
+  c(0.95, "#34C924"),  # Тёмно-зелёный
+  c(1.00, "#0A5F38")   # Тёмно-тёмно-зелёный (максимальная уверенность)
+)
+
+# ── ДЕРЕВО (левая часть) ──
+parent_x_lookup <- setNames(tree_data$x, tree_data$node)
+parent_y_lookup <- setNames(tree_data$y, tree_data$node)
+px <- parent_x_lookup[as.character(edges$parent)]
+py <- parent_y_lookup[as.character(edges$parent)]
+cx <- round(edges$x, 4); cy <- round(edges$y, 4)
+px <- round(px, 4); py <- round(py, 4)
+
+child_nodes <- as.character(edges$node)
+
+## ── имена ветвей и вероятности для hover ──
+
+# (1) карта "номер узла -> имя типса"
+if (!is.null(tips_data$node)) {
+  tip_label_of <- setNames(as.character(tips_data$label), as.character(tips_data$node))
+} else if (!is.null(tree_data$label)) {
+  keep <- !is.na(tree_data$label) & nzchar(as.character(tree_data$label))
+  tip_label_of <- setNames(as.character(tree_data$label)[keep],
+                           as.character(tree_data$node)[keep])
+} else {
+  stop("Нужен столбец tips_data$node или tree_data$label для подписей ветвей.")
 }
 
-# Подписи таксонов
-max_x <- max(tree_data$x, na.rm = TRUE)
-label_offset <- max_x * 0.05 
+# (2) типсы-потомки каждого узла — БЕЗ рекурсии: поднимаемся от типса к корню
+parent_of <- setNames(as.character(edges$parent), as.character(edges$node))
+parent_of <- parent_of[!duplicated(names(parent_of))]   # один родитель на узел
 
-# Разреженные подписи 
+clade_acc  <- list()
+tip_nodes  <- names(tip_label_of)
+ok         <- !is.na(tip_label_of) & nzchar(tip_label_of)
+tip_nodes  <- tip_nodes[ok]
+tip_labels <- unname(tip_label_of[tip_nodes])
+
+for (k in seq_along(tip_nodes)) {
+  nd   <- tip_nodes[k]
+  lab  <- tip_labels[k]
+  seen <- character(0)                      # защита от петель
+  while (!is.na(nd) && nzchar(nd) && !(nd %in% seen)) {
+    seen <- c(seen, nd)
+    old  <- if (nd %in% names(clade_acc)) clade_acc[[nd]] else character(0)
+    clade_acc[[nd]] <- c(old, lab)          # этот типс — потомок узла nd
+    nd <- unname(parent_of[nd])             # шаг к родителю
+  }
+}
+
+clade_tips <- lapply(child_nodes, function(nd) {
+  if (nd %in% names(clade_acc)) unique(clade_acc[[nd]]) else character(0)
+})
+
+n_in_clade  <- vapply(clade_tips, length, integer(1))
+is_tip_branch <- n_in_clade == 1L
+
+# (3) имя ветви: таксон или состав клады
+clade_name <- vapply(clade_tips, function(tt) {
+  if (length(tt) == 0L) return("(empty)")
+  if (length(tt) == 1L) return(tt)
+  if (length(tt) <= 3L) return(paste(tt, collapse = " + "))
+  paste0("MRCA(", tt[1], ", ", tt[length(tt)], ")")
+}, character(1))
+
+# (4) средняя PP конспецифичности внутри клады — прямо из probmat
+clade_pp <- vapply(clade_tips, function(tt) {
+  tt <- intersect(tt, rownames(probmat))
+  if (length(tt) < 2L) return(NA_real_)
+  m <- probmat[tt, tt, drop = FALSE]
+  mean(m[upper.tri(m)])
+}, numeric(1))
+
+# (5) для кончиков: ближайший партнёр по PP
+nearest_txt <- vapply(clade_tips, function(tt) {
+  if (length(tt) != 1L) return("")
+  t1 <- tt[1]
+  if (!(t1 %in% rownames(probmat))) return("")
+  rw <- probmat[t1, , drop = TRUE]
+  rw <- rw[names(rw) != t1]
+  if (!length(rw)) return("")
+  j <- which.max(rw)
+  paste0("<br><b>Closest: </b>", names(rw)[j],
+         " (PP = ", sprintf("%.2f", rw[j]), ")")
+}, character(1))
+
+# (6) надёжное чтение node_posterior: по именам ИЛИ по позиции
+get_node_pp <- function(nd) {
+  if (!exists("node_posterior", inherits = TRUE) || is.null(node_posterior)) return(NA_real_)
+  nd <- as.character(nd)
+  if (!is.null(names(node_posterior)))
+    return(suppressWarnings(as.numeric(unname(node_posterior[nd]))))
+  i <- suppressWarnings(as.integer(nd))
+  if (is.na(i) || i < 1L || i > length(node_posterior)) return(NA_real_)
+  as.numeric(node_posterior[i])
+}
+pp_vals <- vapply(child_nodes, get_node_pp, numeric(1))
+
+branch_colors <- vapply(clade_pp, get_pp_color, character(1))
+
+# (7) сам текст подсказки
+hover_txt <- paste0(
+  "<b>", ifelse(is_tip_branch, "Taxon", "Clade"), ": </b>", clade_name,
+  ifelse(is_tip_branch, "", paste0("<br><b>Tips: </b>", n_in_clade)),
+  ifelse(is.na(clade_pp), "",
+         paste0("<br><b>Mean PP(conspecific): </b>", sprintf("%.2f", clade_pp))),
+  ifelse(is.na(pp_vals), "",
+         paste0("<br><b>Clade posterior: </b>", sprintf("%.2f", pp_vals))),
+  nearest_txt
+)
+
+hover_style <- list(bgcolor = "white", bordercolor = "#888888", align = "left",
+                    font = list(size = 13, family = "monospace", color = "#222222"))
+
+fig_tree <- plotly::plot_ly() %>%
+  plotly::add_segments(          # горизонтальные ветви — носители hover
+    data = data.frame(x = px, xend = cx, y = cy, yend = cy,
+                      col = branch_colors, hov = hover_txt, stringsAsFactors = FALSE),
+    x = ~x, xend = ~xend, y = ~y, yend = ~yend,
+    line = list(width = 5, color = ~I(col)),
+    hovertext = ~hov, hoverinfo = "text", hoverlabel = hover_style,
+    showlegend = FALSE
+  ) %>%
+  plotly::add_segments(          # вертикальные соединители — БЕЗ hover
+    data = data.frame(x = px, xend = px, y = py, yend = cy,
+                      col = branch_colors, stringsAsFactors = FALSE),
+    x = ~x, xend = ~xend, y = ~y, yend = ~yend,
+    line = list(width = 5, color = ~I(col)),
+    hoverinfo = "skip", showlegend = FALSE
+  )
+
+max_x <- max(tree_data$x, na.rm = TRUE)
+label_offset <- max_x * 0.05
 label_step <- max(1, ceiling(n_tips / 40))
-tips_labeled <- tips_data %>%
-  dplyr::mutate(row_num = dplyr::row_number()) %>%
+tips_labeled <- tips_data %>% dplyr::mutate(row_num = dplyr::row_number()) %>%
   dplyr::filter(row_num %% label_step == 1)
 
+# подписи типсов тоже наводимые (по имени, а не по номеру узла)
+tip_hover_by_label <- setNames(hover_txt[is_tip_branch], clade_name[is_tip_branch])
+tips_labeled$hov <- unname(tip_hover_by_label[as.character(tips_labeled$label)])
+tips_labeled$hov[is.na(tips_labeled$hov)] <- as.character(tips_labeled$label)[is.na(tips_labeled$hov)]
+
 fig_tree <- fig_tree %>% plotly::add_text(
-  data = tips_labeled,
-  x = ~x + label_offset, y = ~y, text = ~label,
+  data = tips_labeled, x = ~round(x + label_offset, 4), y = ~round(y, 4), text = ~label,
   textposition = "middle left",
   textfont = list(size = 16, family = "monospace", color = "#333333"),
-  showlegend = FALSE, hoverinfo = "skip")
+  hovertext = ~hov, hoverinfo = "text", hoverlabel = hover_style,
+  showlegend = FALSE) %>% plotly::layout(
+    hovermode = "closest",
+    xaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE, title = "",
+                 range = c(-0.02, round(max_x + label_offset + max_x * 0.1, 4))),
+    yaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE, title = "",
+                 range = c(0.5, n_tips + 0.5), autorange = "reversed")
+  )
 
-# Настройка осей дерева (autorange = "reversed" чтобы y=1 был сверху, как в ggtree)
-fig_tree <- fig_tree %>% plotly::layout(
-  xaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE, title = "",
-               range = c(-0.02, max_x + label_offset + max_x*0.1)),
-  yaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE, title = "",
-               range = c(0.5, n_tips + 0.5), autorange = "reversed")
-)
-
-
-# ТЕПЛОВАЯ КАРТА (правая часть)
-
-hover_text <- matrix(
-  paste0("<b>Taxon 1:</b> ", rownames(probmat)[row(probmat)],
-         "<br><b>Taxon 2:</b> ", colnames(probmat)[col(probmat)],
-         "<br><b>PP(conspecific):</b> ", sprintf("%.2f", probmat)),
-  nrow = n_tips)
-
-custom_colorscale <- list(
-  list(0.00, "#F0FFFF"),  # Почти белый
-  list(0.25, "#BDECB6"),  # Светло-зелёный
-  list(0.50, "#98FB98"),  # Средне-зелёный
-  list(0.95, "#34C924"),  # Тёмно-зелёный
-  list(1.00, "#0A5F38")   # Тёмно-тёмно-зелёный (максимальная уверенность)
-)
-
+# ── ТЕПЛОВАЯ КАРТА (КАТЕГОРИАЛЬНЫЕ ОСИ КАК В РАБОЧЕМ ПРИМЕРЕ!) ──
 fig_heat <- plotly::plot_ly(
   z = probmat,
-  x = 1:n_tips,
-  y = 1:n_tips,
+  x = tip_order,  # ← Категориальная ось!
+  y = tip_order,  # ← Категориальная ось!
   type = "heatmap",
-  colorscale = custom_colorscale,  # Или встроенная палитра viridis
+  colorscale = custom_colorscale_heat,
   zmin = 0, zmax = 1,
-  text = hover_text, hoverinfo = "text",
+  hovertemplate = paste0(
+    "<b>Taxon 1: </b>%{y}<br>",
+    "<b>Taxon 2: </b>%{x}<br>",
+    "<b>PP(conspecific): </b>%{z:.2f}",
+    "<extra></extra>"
+  ),
   showscale = TRUE,
   colorbar = list(
-    title = "PP", 
-    len = 0.5, 
+    title = "PP",
+    len = 0.5,
     x = 1.02,
     tickvals = c(0, 0.25, 0.5, 0.75, 1),
     ticktext = c("0%", "25%", "50%", "75%", "100%")
   )
+) %>% plotly::layout(
+  xaxis = list(title = "", showticklabels = FALSE, showgrid = FALSE, zeroline = FALSE),
+  yaxis = list(title = "", showticklabels = FALSE, showgrid = FALSE, zeroline = FALSE, autorange = "reversed")
 )
 
-# Настройка осей матрицы (совпадает с деревом)
-fig_heat <- fig_heat %>% plotly::layout(
-  xaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE, title = "",
-               range = c(0.5, n_tips + 0.5)),
-  yaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE, title = "",
-               range = c(0.5, n_tips + 0.5), autorange = "reversed")
-)
-
-
-# ОБЪЕДИНЕНИЕ ЧЕРЕЗ SUBPLOT (1:1)
-
+# ── ОБЪЕДИНЕНИЕ (КАК В РАБОЧЕМ ПРИМЕРЕ!) ──
 fig_combined <- plotly::subplot(
   fig_tree, fig_heat,
   nrows = 1,
-  widths = c(0.5, 0.5), # Строго 1:1
-  shareY = TRUE,         # Жесткая синхронизация оси Y
+  widths = c(0.50, 0.50),
+  shareY = FALSE,  # ← ВАЖНО: убираем, оси разного типа
   titleX = FALSE, titleY = FALSE
-)
-
-fig_combined <- fig_combined %>% plotly::layout(
+) %>% plotly::layout(
+  yaxis = list(domain = c(0, 1)),   # Ось дерева
+  yaxis2 = list(domain = c(0, 1)),  # Ось матрицы
   title = list(text = "bGMYC4 Conspecificity Probabilities + Consensus Tree", x = 0.5),
   plot_bgcolor = "white",
-  hovermode = "closest",
-  margin = list(l = 10, r = 60, t = 80, b = 10)
+  margin = list(l = 10, r = 80, t = 80, b = 30)
 )
 
-# Сохранение
+# ── ЭКСПОРТ HTML ──
 html_path <- file.path(DELIM_DIR, "bGMYC_interactive_heatmap.html")
-htmlwidgets::saveWidget(fig_combined, html_path, selfcontained = TRUE, title = "bGMYC Interactive Heatmap")
+htmlwidgets::saveWidget(fig_combined, html_path, selfcontained = FALSE, title = "bGMYC Interactive Heatmap")
+
 cat(sprintf("✅ Сохранено: %s\n", normalizePath(html_path)))
-cat("🌐 Откройте HTML в браузере. Дерево слева, матрица справа (1:1), всё выровнено по Y.\n\n")
+cat(sprintf("📦 Размер файла: %.1f MB\n", file.info(html_path)$size / 1024^2))
+cat("🌐 Откройте HTML. Hover показывает имена таксонов + PP (стандартный Plotly)!\n\n")
 
-
-# Функция конвертации списка кластеров в датафрейм
-create_motu_df <- function(out_list, method_name) {
-  motu_list <- lapply(seq_along(out_list), function(i) {
-    data.frame(
-      Sequence = out_list[[i]],
-      MOTU = paste0(method_name, "_", i),
-      stringsAsFactors = FALSE
-    )
-  })
-  do.call(rbind, motu_list)
+# # EN: Export clusters at different thresholds / Экспорт кластеров на разных порогах
+thresholds <- c(0.95, 0.5, 0.01, 0.001)
+for (p in thresholds) {
+  out <- bgmyc.point(probmat, ppcutoff = p)
+  df  <- data.frame(
+    Sequence   = unlist(out),
+    MOTU_bGMYC = rep(seq_along(out), lengths(out)),
+    stringsAsFactors = FALSE
+  )
+  fname <- file.path(DELIM_DIR, sprintf("Delimitation_bGMYC_%.3f.csv", p))
+  utils::write.table(df, file = fname, row.names = FALSE,
+                     sep = ";", dec = ".", quote = FALSE)
+  cat(sprintf("✅ ppcutoff=%.3f → %d кластеров, %d строк → %s\n",
+              p, length(out), nrow(df), basename(fname)))
 }
 
-# Автоматическая генерация таблиц
-cat("\n💾 Сохраняю таблицы делимитации...\n")
-
-# Стандартный порог (p = 0.05)
-out_005 <- bgmyc.point(probmat, ppcutoff = 0.05)
-df_005 <- data.frame(
-  Sequence = unlist(out_005),
-  MOTU_bGMYC = rep(seq_along(out_005), lengths(out_005)),
-  stringsAsFactors = FALSE
-)
-write.table(df_005, file = file.path(DELIM_DIR, "Delimitation_bGMYC_005.csv"), 
-            row.names = FALSE, sep = ";", dec = ".", quote = FALSE, fileEncoding = "UTF-8")
-cat(sprintf("   ✅ p=0.05: Delimitation_bGMYC_005.csv (%d кластеров)\n", length(out_005)))
-
-# Строгий порог (p = 0.01)
-out_001 <- bgmyc.point(probmat, ppcutoff = 0.01)
-df_001 <- data.frame(
-  Sequence = unlist(out_001),
-  MOTU_bGMYC = rep(seq_along(out_001), lengths(out_001)),
-  stringsAsFactors = FALSE
-)
-write.table(df_001, file = file.path(DELIM_DIR, "Delimitation_bGMYC_001.csv"), 
-            row.names = FALSE, sep = ";", dec = ".", quote = FALSE, fileEncoding = "UTF-8")
-cat(sprintf("   ✅ p=0.01: Delimitation_bGMYC_001.csv (%d кластеров)\n", length(out_001)))
-
-# Экспорт полной таблицы вероятностей
-spec_out  <- bgmyc.spec(final_res)
-write.csv(spec_out$specprobs, file.path(DELIM_DIR, "bGMYC_delimitation_results.csv"), 
-          row.names = FALSE, fileEncoding = "UTF-8")
-cat("   📊 Вероятности: bGMYC_delimitation_results.csv\n")
-
-cat("\n📋 Топ-10 кластеров (p=0.05):\n")
-for (i in seq_along(out_005)[1:min(10, length(out_005))]) {
-  taxa  <- out_005[[i]]
-  cat(sprintf("   %2d: %s%s\n", i, paste(taxa[1:min(3, length(taxa))], collapse = ", "),
-              if (length(taxa) > 3) "..." else ""))
-}
+spec_out <- bgmyc.spec(final_res)
+utils::write.csv(spec_out$specprobs,
+                 file = file.path(DELIM_DIR, "bGMYC_full_probs.csv"),
+                 row.names = FALSE)
+cat("✅ bGMYC_full_probs.csv сохранён в", DELIM_DIR, "\n")
 
 cat("\n🎉 Интерактивный анализ bGMYC4 завершён!\n")

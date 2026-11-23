@@ -1,3 +1,10 @@
+#' Diagnostic plots of coalescent vs Yule rates
+#'
+#' 2x2 panel of `lambda.coal / lambda.div.mod` (trace, log10 trace, histograms).
+#' Values near 1 indicate an indistinct threshold and unreliable delimitation.
+#' @param x A `"bgmycrates"` object from [checkrates()].
+#' @param ... Unused.
+#' @return No return value; called for side effects.
 #' @export
 plot.bgmycrates <- function(x, ...) {
   oldpar <- par(no.readonly = TRUE)

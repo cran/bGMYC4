@@ -1,8 +1,19 @@
+#' Trace plots of a single-tree bGMYC MCMC
+#'
+#' 2x2 panel: `py`, `pc`, threshold, log-posterior.
+#' @param x A `"singlebgmyc"` object.
+#' @param burnin,thinning Applied to the ALREADY thinned retained samples;
+#'   leave at defaults (0, 1). A warning is issued otherwise.
+#' @param ... Passed to [graphics::plot()].
+#' @return No return value; called for side effects.
 #' @export
 plot.singlebgmyc <- function(x, burnin = 0, thinning = 1, ...) {
+  if (burnin != 0 || thinning != 1)
+    warning("'x$par' already contains only retained (post burn-in, thinned) samples; ",
+            "'burnin'/'thinning' here re-filter the retained samples, not the original chain.")
   oldpar <- par(no.readonly = TRUE)
   on.exit(par(oldpar))
-  
+
   result <- x
   par(mfrow = c(2, 2))
   ylabels <- c("p.div", "p.coal", "threshold", "logposterior")
